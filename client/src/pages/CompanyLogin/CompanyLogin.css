@@ -1,28 +1,27 @@
-.login-form {
+.company-login-form {
   display: flex;
   flex-direction: column;
   margin: auto;
 }
 
-.username-input {
+.company-username-input {
   outline: none;
   border-radius: 0;
   border-style: solid;
 }
 
-.password-input {
+.company-password-input {
   outline: none;
   border-radius: 0;
   border-style: solid;
   border-top: 0;
 }
 
-.sign-in-button {
+.company-sign-in-button {
   border-radius: 0;
   padding: 0.2rem;
 }
 
-.sign-in-button:active {
+.company-sign-in-button:active {
   background-color:#868686;
 }
-

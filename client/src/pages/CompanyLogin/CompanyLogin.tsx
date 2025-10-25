@@ -1,19 +1,20 @@
-import "./Login.css";
+import "./CompanyLogin.css"
 import { useState } from "react";
 import { Link } from 'react-router-dom';
 
-const Login = () => {
+
+const CompanyLogin = () => {
     const [password, setPassword] = useState("");
     const [username, setUsername] = useState("");
-  const usernameInputProps = {
-        className: "username-input",
+  const companyusernameInputProps = {
+        className: "company-username-input",
     value: username,
     onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
       setUsername(e.target.value),
-    placeholder: "Username",
+    placeholder: "Company Username",
   };
-  const passwordInputProps = {
-      className: "password-input",
+  const companypasswordInputProps = {
+      className: "company-password-input",
     type: "password",
     value: password,
     onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
@@ -23,21 +24,20 @@ const Login = () => {
 
   return (
     <>
-      <form className="login-form" onSubmit={() => {}}>
-        <input {...usernameInputProps} />
-        <input {...passwordInputProps} />
+      <form className="company-login-form" onSubmit={() => {}}>
+        <input {...companyusernameInputProps} />
+        <input {...companypasswordInputProps} />
         <button type="submit" className="sign-in-button">
           Sign In
         </button>
       </form>
 
-    <Link to="/CompanyLogin" className="button-style-class">
-      Log in as a company!
+      <Link to="/" className="button-style-class">
+      Log in as a Student!
     </Link>
     </>
 
-  
   );
 };
 
-export default Login;
+export default CompanyLogin;
