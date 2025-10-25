@@ -1,13 +1,7 @@
-import Login from './pages/Login/Login.tsx'
-import './App.css'
+import Home from "./pages/Home/Home.tsx";
 
-function App() {
-
-  return (
-    <>
-      <Login/>
-    </>
-  )
+const App = () => {
+  return <Home />;
 }
 
-export default App
+export default App;
