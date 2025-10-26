@@ -7,15 +7,15 @@ interface TrafficCardProps {
   onClick: () => void;
 }
 
-const DiningCard = ({ name, traffic, soundLevel, onClick }: TrafficCardProps) => {
+const TrafficCard = ({ name, traffic, soundLevel, onClick }: TrafficCardProps) => {
   return (
-    <div className="dining-card">
+    <div className="traffic-card" onClick={onClick}>
       <h2 className="card-title">{name}</h2>
       <TrafficIndicator level={traffic < 5 ? "light" : (traffic < 10 ? "moderate" : "busy")} />
       <p className="wait-time">Current Occupancy: {traffic}</p>
-      <p className="sound-level">Sound Level: {soundLevel}</p>
+      <p className="sound-level">Sound Level: {soundLevel}{" db"}</p>
     </div>
   );
 }
 
-export default DiningCard;
+export default TrafficCard;

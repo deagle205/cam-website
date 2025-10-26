@@ -2,7 +2,6 @@ import "./Home.css";
 import TrafficCard from "../../components/TrafficCard/TrafficCard.tsx";
 import { useState, useEffect } from "react";
 
-
 interface TrafficEntry {
   _id: string;
   buildingId: string;
@@ -20,7 +19,8 @@ interface BuildingTraffic {
 const Home = () => {
   const [trafficData, setTrafficData] = useState<TrafficEntry[]>([]);
   const [buildings, setBuildings] = useState<BuildingTraffic[]>([]);
-  const [selectedBuilding, setSelectedBuilding] = useState<BuildingTraffic | null>(null);
+  const [selectedBuilding, setSelectedBuilding] =
+    useState<BuildingTraffic | null>(null);
 
   const API_URL = import.meta.env.VITE_API_URL!;
   const API_KEY = import.meta.env.VITE_API_KEY!;
@@ -30,11 +30,10 @@ const Home = () => {
     const fetchTraffic = async () => {
       try {
         const res = await fetch(API_URL, {
-          headers: { "x-api-key": API_KEY }
+          headers: { "x-api-key": API_KEY },
         });
-        console.log("test");
         const data = await res.json();
-        
+
         setTrafficData(data);
       } catch (err) {
         console.error("Error fetching traffic:", err);
@@ -52,16 +51,19 @@ const Home = () => {
       grouped[entry.buildingId].push(entry);
     });
 
-    const processed: BuildingTraffic[] = Object.entries(grouped).map(([buildingId, entries]) => {
-      const sorted = entries.sort(
-        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-      );
-      return {
-        buildingId,
-        latest: sorted[0],
-        history: sorted.slice(0, 50),
-      };
-    });
+    const processed: BuildingTraffic[] = Object.entries(grouped).map(
+      ([buildingId, entries]) => {
+        const sorted = entries.sort(
+          (a, b) =>
+            new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+        );
+        return {
+          buildingId,
+          latest: sorted[0],
+          history: sorted.slice(0, 50),
+        };
+      }
+    );
 
     setBuildings(processed);
   }, [trafficData]);
@@ -86,17 +88,23 @@ const Home = () => {
         </div>
 
         {selectedBuilding && (
-          <div className="history-panel">
-            <h2>History for {selectedBuilding.buildingId}</h2>
-            <ul>
-              {selectedBuilding.history.map((entry) => (
-                <li key={entry._id}>
-                  {new Date(entry.timestamp).toLocaleString()}: {entry.count} people
-                  {entry.soundLevel !== undefined ? ` (sound: ${entry.soundLevel})` : ""}
-                </li>
-              ))}
-            </ul>
-          </div>
+          <>
+            <div
+              className="history-overlay"
+              onClick={() => setSelectedBuilding(null)}
+            />
+            <div className="history-panel">
+              <h2>History for {selectedBuilding.buildingId}</h2>
+              <ul>
+                {selectedBuilding.history.map((entry) => (
+                  <li key={entry._id}>
+                    {new Date(entry.timestamp).toLocaleString()}: {entry.count}{" "}
+                    people{", "}{entry.soundLevel}{" db"}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </>
         )}
       </main>
     </div>
