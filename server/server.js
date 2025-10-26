@@ -20,7 +20,9 @@ mongoose.connect(process.env.MONGO_CONNECTION_STRING, {
 // example routes
 app.get("/traffic", async (req, res) => {
   try {
-    const data = await Traffic.find();
+    const data = await Traffic.find()
+      .sort({ timestamp: -1 })
+      .limit(50);
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -41,12 +43,14 @@ app.get("/dining", async (req, res) => {
 
 app.post("/traffic", apiKeyAuth, async (req, res) => {
   try {
-    const data = await Traffic.find(req.body)
-      .sort({ timestamp: -1 }) // newest first
-      .limit(50);
-    res.json(data);
+    const newEntry = new Traffic(req.body);
     await newEntry.save();
-    res.status(201).json(newEntry);
+
+    const data = await Traffic.find()
+      .sort({ timestamp: -1 })
+      .limit(50);
+
+    res.status(201).json(data);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -56,7 +60,12 @@ app.post("/dining", apiKeyAuth, async (req, res) => {
   try {
     const newEntry = new DiningData(req.body);
     await newEntry.save();
-    res.status(201).json(newEntry);
+
+    const data = await DiningData.find()
+      .sort({ timestamp: -1 })
+      .limit(50);
+
+    res.status(201).json(data);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
