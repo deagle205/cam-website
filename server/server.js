@@ -41,7 +41,7 @@ app.get("/dining", async (req, res) => {
 
 app.post("/traffic", apiKeyAuth, async (req, res) => {
   try {
-    const data = await Traffic.find()
+    const data = await Traffic.find(req.body)
       .sort({ timestamp: -1 }) // newest first
       .limit(50);
     res.json(data);
