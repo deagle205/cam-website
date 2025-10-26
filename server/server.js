@@ -1,7 +1,6 @@
 import express from "express";
 import mongoose from "mongoose";
 import dotenv from "dotenv";
-import DiningData from "./models/DiningData.js";
 import Traffic from "./models/Traffic.js";
 import apiKeyAuth from "./models/middleware/apiKeyAuth.js";
 
@@ -18,7 +17,7 @@ mongoose.connect(process.env.MONGO_CONNECTION_STRING, {
   .catch(err => console.error("MongoDB connection error:", err));
 
 // example routes
-app.get("/traffic", async (req, res) => {
+app.get("/traffic", apiKeyAuth, async (req, res) => {
   try {
     const data = await Traffic.find()
       .sort({ timestamp: -1 })
