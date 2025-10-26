@@ -20,13 +20,16 @@ mongoose.connect(process.env.MONGO_CONNECTION_STRING, {
 app.use(cors({
   origin: [
     "http://localhost:5173",
-    "https://cam-website.onrender.com"
+    "https://cam-website-kappa.vercel.app"
   ],
   methods: ["GET", "POST"],
   credentials: true
 }));
 
-// example routes
+app.get("/", async (req, res) => {
+  res.send("Server is running.");
+})
+
 app.get("/traffic", apiKeyAuth, async (req, res) => {
   try {
     const data = await Traffic.find()
