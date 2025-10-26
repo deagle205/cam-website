@@ -144,3 +144,5 @@ yarn.lock
 *.njsproj
 *.sln
 *.sw?
+
+keys.json
