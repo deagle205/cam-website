@@ -3,7 +3,7 @@
 Raspberry Pi 5 Live Camera with Roboflow CCTV Person Detection
 OV5647 ArduCam with Day/Night modes - Custom Model Support
 """
-
+from dotenv import load_dotenv
 import cv2
 import time
 import requests
@@ -13,6 +13,35 @@ import numpy as np
 from io import BytesIO
 from PIL import Image
 import os
+import threading
+import RPi.GPIO as GPIO
+import time
+import serial
+from math import log10
+
+ser= serial.Serial('/dev/ttyACM0', 9600, timeout=1)
+time.sleep(2)
+
+interval = 300
+
+def binary_to_DB(binary_string):
+    decimal_value = int(binary_string, 2)
+   
+    voltage = decimal_value * (5.0 / 1023.0)
+   
+    if voltage < 0.001:
+        voltage = 0.001
+       
+    db = 20 * log10(voltage / 0.00631)
+   
+    if db < 0:
+        db = 0
+    if db > 120:
+        db = 120
+       
+    return db
+
+   
 
 SERVER_URL = os.getenv("SERVER_URL")
 CAMERA_API_KEY = os.getenv("CAMERA_API_KEY")
@@ -26,7 +55,7 @@ DISPLAY_WINDOW = True  # Set to False if running headless
 INFERENCE_INTERVAL = 0.5  # Seconds between API calls
 CONFIDENCE_THRESHOLD = 0.5  # Minimum confidence to display detections
 
-# Virtual line configuration
+# Virtual line configurationq
 LINE_POSITION = 320  # X position of vertical line (center of 640px frame)
 CROSSING_THRESHOLD = 30  # Pixels object must cross to register
 
@@ -58,14 +87,14 @@ DAY_MODE = {
 def setup_camera(mode="day"):
     """Initialize ArduCam OV5647 with selectable day/night settings"""
     picam2 = Picamera2()
-   
+
     # List available cameras (helpful for debugging)
     cameras = picam2.global_camera_info()
     print(f"Available cameras: {cameras}")
-   
+
     # Select mode settings
     controls = NIGHT_MODE if mode == "night" else DAY_MODE
-   
+
     # Configure for OV5647
     config = picam2.create_preview_configuration(
         main={"size": (640, 480)},
@@ -88,11 +117,11 @@ def frame_to_base64(frame):
     """Convert frame to base64 for API upload - handles OV5647 color format"""
     # Frame comes in as RGB from picamera2, convert to proper format for PIL
     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-   
+
     # Save to bytes buffer
     buffered = BytesIO()
     pil_image.save(buffered, format="JPEG", quality=85)
-   
+
     # Encode to base64
     img_str = base64.b64encode(buffered.getvalue()).decode()
     return img_str
@@ -129,7 +158,7 @@ def draw_detections(frame, predictions):
     """Draw bounding boxes and labels on frame"""
     if not predictions or 'predictions' not in predictions:
         return frame
-   
+
     for pred in predictions['predictions']:
         x = int(pred['x'] - pred['width'] / 2)
         y = int(pred['y'] - pred['height'] / 2)
@@ -137,17 +166,17 @@ def draw_detections(frame, predictions):
         h = int(pred['height'])
         center_x = int(pred['x'])
         center_y = int(pred['y'])
-       
+
         confidence = pred['confidence']
         label = pred.get('class', 'detection')
-       
+
         if confidence >= CONFIDENCE_THRESHOLD:
             # Draw bounding box
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-           
+
             # Draw center point
             cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
-           
+
             # Draw label with confidence
             label_text = f"{label}: {confidence:.2f}"
             label_size, _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
@@ -155,48 +184,48 @@ def draw_detections(frame, predictions):
                          (x + label_size[0], y), (0, 255, 0), -1)
             cv2.putText(frame, label_text, (x, y - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-   
+
     return frame
 
 def check_line_crossing(predictions):
     """Check if objects crossed the virtual line and update count"""
     global tracked_objects, inside_count
-   
+
     if not predictions or 'predictions' not in predictions:
         return
-   
+
     current_frame_ids = set()
-   
+
     for pred in predictions['predictions']:
         if pred['confidence'] < CONFIDENCE_THRESHOLD:
             continue
-           
+
         # Use center of bounding box
         center_x = int(pred['x'])
         center_y = int(pred['y'])
         obj_class = pred.get('class', 'object')
-       
+
         # Create unique ID based on position and class
         obj_id = f"{obj_class}_{center_y // 50}"  # Group by vertical region
         current_frame_ids.add(obj_id)
-       
+
         # Check if object was tracked before
         if obj_id in tracked_objects:
             prev_x = tracked_objects[obj_id]
-           
+
             # Check for crossing from left to right (ENTERING)
             if prev_x < LINE_POSITION - CROSSING_THRESHOLD and center_x > LINE_POSITION + CROSSING_THRESHOLD:
                 inside_count += 1
                 print(f">>> {obj_class} ENTERED | Inside count: {inside_count}")
-           
+
             # Check for crossing from right to left (EXITING)
             elif prev_x > LINE_POSITION + CROSSING_THRESHOLD and center_x < LINE_POSITION - CROSSING_THRESHOLD:
                 inside_count = max(0, inside_count - 1)
                 print(f"<<< {obj_class} EXITED | Inside count: {inside_count}")
-       
+
         # Update position
         tracked_objects[obj_id] = center_x
-   
+
     # Clean up objects no longer detected (timeout after 2 seconds worth of frames)
     # Keep tracked_objects small by removing old entries
     ids_to_remove = [oid for oid in tracked_objects if oid not in current_frame_ids]
@@ -206,42 +235,53 @@ def check_line_crossing(predictions):
 def draw_virtual_line(frame):
     """Draw the virtual detection line on frame"""
     height = frame.shape[0]
-   
+
     # Draw vertical line
     cv2.line(frame, (LINE_POSITION, 0), (LINE_POSITION, height), (255, 0, 0), 3)
-   
+
     # Draw arrows showing direction
     # Left arrow (OUT)
     cv2.arrowedLine(frame, (LINE_POSITION - 40, 50), (LINE_POSITION - 10, 50), (0, 0, 255), 2)
     cv2.putText(frame, "OUT", (LINE_POSITION - 80, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-   
+
     # Right arrow (IN)
     cv2.arrowedLine(frame, (LINE_POSITION + 10, 50), (LINE_POSITION + 40, 50), (0, 255, 0), 2)
     cv2.putText(frame, "IN", (LINE_POSITION + 50, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-   
+
     return frame
 
-def send_to_server(count):
+def send_to_server(count, avg_sound_level):
     try:
         response = requests.post(
-            SERVER_URL + "traffic",
+            SERVER_URL,
             headers={"x-api-key": CAMERA_API_KEY, "Content-Type": "application/json"},
-            json={"buildingId": "Scott", "count": count}
+            json={"buildingId": "Example Location", "count": count, "soundLevel": avg_sound_level}
         )
         print(f"Posted to server: {response.status_code}")
     except Exception as e:
         print(f"Failed to post to server: {e}")
 
-def periodic_send(interval=300):
+def periodic_send(interval):
     """Send the current inside_count to the server every `interval` seconds."""
-    global inside_count
     while True:
-        time.sleep(interval)
-        send_to_server(inside_count)
-
+        current_time = time.time()
+        end_time = current_time + interval
+        db_readings = []
+        while end_time > time.time():
+            if ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8').strip()
+                try:
+                    db_value = float(f'{binary_to_DB(line):.2f}')
+                    db_readings.append(db_value)
+                except ValueError:
+                    pass
+            time.sleep(0.1)
+           
+        send_to_server(inside_count, sum(db_readings) / max(len(db_readings), 1))
+       
 def main():
-    """Update server every 5 minutes"""
-    threading.Thread(target=periodic_send, args=(5 * 60,), daemon=True).start()
+    """Update server every interval"""
+    threading.Thread(target=periodic_send, args=(interval,), daemon=True).start()
     """Main loop for camera capture and inference"""
     print("Starting Raspberry Pi 5 CCTV Detection")
     print(f"Model: {API_URL}")
@@ -250,25 +290,25 @@ def main():
     print("  Press 'N' - Switch to NIGHT mode")
     print("  Press 'D' - Switch to DAY mode")
     print("  Press 'Q' - Quit\n")
-   
+
     # Initialize camera in day mode (normal colors)
     picam2 = setup_camera(mode="day")
     current_mode = "day"
-   
+
     last_inference_time = 0
     latest_predictions = None
     frame_count = 0
-   
+
 
     try:
         while True:
             # Capture frame from camera
             frame = picam2.capture_array()
-           
+
             # Fix color channels for OV5647 - convert RGB to BGR for OpenCV
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             frame_count += 1
-           
+
             # Run inference at specified intervals
             current_time = time.time()
             if current_time - last_inference_time >= INFERENCE_INTERVAL:
@@ -281,32 +321,32 @@ def main():
                         conf = pred['confidence']
                         cls = pred.get('class', 'object')
                         print(f"    {i}. {cls} (confidence: {conf:.2f})")
-                   
+
                     # Check for line crossings
                     check_line_crossing(latest_predictions)
-               
+
                 last_inference_time = current_time
-           
+
             # Draw virtual line
             frame = draw_virtual_line(frame)
-           
+
             # Draw detections on frame
             if latest_predictions:
                 frame = draw_detections(frame, latest_predictions)
-           
+
             # Add frame counter and status
             fps_text = f"Frame: {frame_count} | Mode: {current_mode.upper()} | Inside: {inside_count}"
             cv2.putText(frame, fps_text, (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-           
+
             status_text = "Analyzing..." if (current_time - last_inference_time < 0.1) else "Monitoring"
             cv2.putText(frame, status_text, (10, 60),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-           
+
             # Display frame if enabled
             if DISPLAY_WINDOW:
                 cv2.imshow('CCTV Detection System', frame)
-               
+
                 # Check for keyboard commands
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q') or key == ord('Q'):
@@ -318,10 +358,10 @@ def main():
                     current_mode = switch_camera_mode(picam2, "day")
             else:
                 time.sleep(0.01)
-   
+
     except KeyboardInterrupt:
         print("\nInterrupted by user")
-   
+
     finally:
         picam2.stop()
         if DISPLAY_WINDOW:
