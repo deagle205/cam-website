@@ -29,18 +29,6 @@ app.get("/traffic", async (req, res) => {
   }
 });
 
-
-app.get("/dining", async (req, res) => {
-  try {
-    const data = await DiningData.find()
-      .sort({ timestamp: -1 }) // newest first
-      .limit(50);
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.post("/traffic", apiKeyAuth, async (req, res) => {
   try {
     const newEntry = new Traffic(req.body);
@@ -55,22 +43,6 @@ app.post("/traffic", apiKeyAuth, async (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-
-app.post("/dining", apiKeyAuth, async (req, res) => {
-  try {
-    const newEntry = new DiningData(req.body);
-    await newEntry.save();
-
-    const data = await DiningData.find()
-      .sort({ timestamp: -1 })
-      .limit(50);
-
-    res.status(201).json(data);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
 
 
 const PORT = process.env.PORT || 5000;
