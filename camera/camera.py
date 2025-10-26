@@ -236,8 +236,8 @@ def periodic_send(interval=300):
     """Send the current inside_count to the server every `interval` seconds."""
     global inside_count
     while True:
-        send_to_server(inside_count)
         time.sleep(interval)
+        send_to_server(inside_count)
 
 def main():
     """Update server every 5 minutes"""
