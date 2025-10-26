@@ -98,8 +98,10 @@ const Home = () => {
               <ul>
                 {selectedBuilding.history.map((entry) => (
                   <li key={entry._id}>
-                    {new Date(entry.timestamp).toLocaleString()}: {entry.count}{" "}
-                    people{", "}{entry.soundLevel}{" db"}
+                    {new Date(entry.timestamp).toLocaleString()}: {entry.count}
+                    {entry.count != 1 ? " people, " : " person, "}
+                    {entry.soundLevel}
+                    {" db"}
                   </li>
                 ))}
               </ul>
