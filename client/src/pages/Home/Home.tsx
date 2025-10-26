@@ -32,7 +32,9 @@ const Home = () => {
         const res = await fetch(API_URL, {
           headers: { "x-api-key": API_KEY }
         });
+        console.log("test");
         const data = await res.json();
+        
         setTrafficData(data);
       } catch (err) {
         console.error("Error fetching traffic:", err);

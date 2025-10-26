@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import dotenv from "dotenv";
 import Traffic from "./models/Traffic.js";
 import apiKeyAuth from "./models/middleware/apiKeyAuth.js";
+import cors from "cors";
 
 dotenv.config();
 
@@ -15,6 +16,15 @@ mongoose.connect(process.env.MONGO_CONNECTION_STRING, {
   useUnifiedTopology: true
 }).then(() => console.log("Connected to MongoDB Atlas"))
   .catch(err => console.error("MongoDB connection error:", err));
+
+app.use(cors({
+  origin: [
+    "http://localhost:5173",
+    "https://cam-website.onrender.com"
+  ],
+  methods: ["GET", "POST"],
+  credentials: true
+}));
 
 // example routes
 app.get("/traffic", apiKeyAuth, async (req, res) => {
