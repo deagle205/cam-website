@@ -1,0 +1,338 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "time.h"
+#include <DHT.h>
+#include <driver/i2s.h>
+
+// ── Setup ─────────────────────────────────────────────────────────────────────
+const char* SSID     = "Eagle’s Nest";
+const char* PASSWORD = "rrf43078";
+const char* PI_IP    = "192.168.68.119";   // ← fill in your Pi's IP
+const int   PI_PORT  = 5000;
+
+#define PIR_PIN 13
+#define DHT_PIN 14
+
+// INMP441 I2S mic pins
+#define I2S_WS  15
+#define I2S_SD  12   // GPIO12 must be LOW at boot — see note below
+#define I2S_SCK 2
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+#define DHT_TYPE         DHT22
+#define CLIP_DURATION_MS 60000   // 10 second clip on motion
+#define FRAME_DELAY_MS   100     // ~10 fps
+#define SAMPLE_RATE      16000
+#define SENSOR_INTERVAL  600000  // 10 minutes
+#define MOTION_COOLDOWN  000    // 8 seconds before re-arming PIR
+
+// ── ESP32-CAM AI-Thinker pinout ───────────────────────────────────────────────
+#define PWDN_GPIO_NUM  32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM  0
+#define SIOD_GPIO_NUM  26
+#define SIOC_GPIO_NUM  27
+#define Y9_GPIO_NUM    35
+#define Y8_GPIO_NUM    34
+#define Y7_GPIO_NUM    39
+#define Y6_GPIO_NUM    36
+#define Y5_GPIO_NUM    21
+#define Y4_GPIO_NUM    19
+#define Y3_GPIO_NUM    18
+#define Y2_GPIO_NUM    5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM  23
+#define PCLK_GPIO_NUM  22
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+unsigned long lastSensorSend = 0;
+unsigned long lastMotionTime = 0;
+bool          motionActive   = false;
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_VGA;   // 640×480 — drop to QVGA if too slow
+  config.jpeg_quality = 12;
+  config.fb_count     = 2;
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("ERROR: Camera init failed");
+    return false;
+  }
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_brightness(s, 0);
+  s->set_contrast(s, 0);
+  s->set_saturation(s, 0);
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_exposure_ctrl(s, 1);
+
+  Serial.println("Camera OK");
+  return true;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTE on GPIO12: the INMP441 DATA pin is on GPIO12, which is a boot-strapping
+// pin on the ESP32. It must be LOW at boot or the board won't start. This is
+// fine as long as nothing pulls it HIGH during power-up (INMP441 DATA is Hi-Z
+// until the I2S clock starts, so it's normally fine in practice).
+// ─────────────────────────────────────────────────────────────────────────────
+bool initI2S() {
+  i2s_config_t i2s_config = {
+    .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate          = SAMPLE_RATE,
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,  // INMP441 outputs 24-bit in 32-bit frame
+    .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count        = 4,
+    .dma_buf_len          = 256,
+    .use_apll             = false,
+    .tx_desc_auto_clear   = false,
+    .fixed_mclk           = 0
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num   = I2S_SCK,
+    .ws_io_num    = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num  = I2S_SD
+  };
+
+  if (i2s_driver_install(I2S_NUM_1, &i2s_config, 0, NULL) != ESP_OK) {
+    Serial.println("ERROR: I2S driver install failed");
+    return false;
+  }
+  i2s_set_pin(I2S_NUM_1, &pin_config);
+  Serial.println("I2S OK");
+  return true;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+void connectWiFi() {
+  WiFi.begin(SSID, PASSWORD);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\nWiFi failed — restarting");
+    ESP.restart();
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+void sendSensorData() {
+  float temp = dht.readTemperature();
+  float hum  = dht.readHumidity();
+
+  if (isnan(temp) || isnan(hum)) {
+    Serial.println("[Sensor] DHT22 read failed");
+    return;
+  }
+
+  HTTPClient http;
+  String url = "http://" + String(PI_IP) + ":" + String(PI_PORT) + "/sensor";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(5000);
+
+  String body = "{\"temperature\":" + String(temp, 1) +
+                ",\"humidity\":"    + String(hum, 1)  + "}";
+
+  int code = http.POST(body);
+  Serial.printf("[Sensor] → Pi: %d | Temp: %.1f°C | Hum: %.1f%%\n", code, temp, hum);
+  http.end();
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wire format (must match Pi receiver exactly):
+//   [4-byte LE uint32 = payload_len] [payload_len bytes]
+//   payload is JPEG if it starts with FFD8, otherwise int32 PCM audio
+//   [4-byte 0xFFFFFFFF] = end of clip
+// ─────────────────────────────────────────────────────────────────────────────
+void captureAndSendClip() {
+  Serial.println("[Clip] Motion detected — sending clip");
+
+  const uint32_t AUDIO_SAMPLES = 512;  // samples per audio packet
+
+  // Raw WiFiClient for streaming POST — HTTPClient buffers the body,
+  // which doesn't work for a 10-second interleaved video+audio stream.
+  WiFiClient client;
+  if (!client.connect(PI_IP, PI_PORT)) {
+    Serial.println("[Clip] Could not connect to Pi");
+    return;
+  }
+
+  // Send raw HTTP POST headers manually so we can stream the body
+  client.println("POST /motion_clip HTTP/1.1");
+  client.println("Host: " + String(PI_IP) + ":" + String(PI_PORT));
+  client.println("Content-Type: application/octet-stream");
+  client.println("X-Stream-Type: mjpeg-audio");
+  client.println("Transfer-Encoding: chunked");
+  client.println("Connection: close");
+  client.println();
+
+  auto writeChunk = [&](const uint8_t* data, size_t len) {
+    // HTTP/1.1 chunked encoding: "<hex-len>\r\n<data>\r\n"
+    // Write size line
+    char sizeLine[12];
+    snprintf(sizeLine, sizeof(sizeLine), "%X\r\n", (unsigned int)len);
+    client.print(sizeLine);
+    // Write data
+    size_t sent = 0;
+    while (sent < len) {
+      size_t batch = min((size_t)1024, len - sent);
+      client.write(data + sent, batch);
+      sent += batch;
+    }
+    // Write trailing CRLF (marks end of this chunk's data)
+    client.print("\r\n");
+  };
+
+  unsigned long start = millis();
+
+  while (millis() - start < CLIP_DURATION_MS) {
+
+    // ── Video frame ───────────────────────────────────────────────────────────
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) {
+      // Send length prefix (4 bytes) + JPEG payload as one contiguous chunk
+      // so the Pi's stream reader sees [len][JPEG] without HTTP framing in between
+      uint32_t flen = (uint32_t)fb->len;
+
+      // Build a single buffer: 4-byte LE length + JPEG bytes
+      // Sending them as two separate writeChunk() calls would insert
+      // HTTP chunk boundaries between them, confusing the length-prefix parser.
+      size_t   totalLen = 4 + fb->len;
+      uint8_t* frameBuf = (uint8_t*)malloc(totalLen);
+      if (frameBuf) {
+        memcpy(frameBuf, &flen, 4);
+        memcpy(frameBuf + 4, fb->buf, fb->len);
+        writeChunk(frameBuf, totalLen);
+        free(frameBuf);
+      }
+      esp_camera_fb_return(fb);
+    }
+
+    // ── Audio chunk ───────────────────────────────────────────────────────────
+    int32_t audioBuffer[AUDIO_SAMPLES];
+    size_t  bytesRead = 0;
+    i2s_read(I2S_NUM_1, audioBuffer, sizeof(audioBuffer), &bytesRead, pdMS_TO_TICKS(50));
+
+    if (bytesRead > 0) {
+      // Same approach: send length prefix + raw PCM in one chunk
+      uint32_t alen     = (uint32_t)bytesRead;
+      size_t   totalLen = 4 + bytesRead;
+      uint8_t* audioBuf = (uint8_t*)malloc(totalLen);
+      if (audioBuf) {
+        memcpy(audioBuf, &alen, 4);
+        memcpy(audioBuf + 4, audioBuffer, bytesRead);
+        writeChunk(audioBuf, totalLen);
+        free(audioBuf);
+      }
+    }
+
+    delay(FRAME_DELAY_MS);
+  }
+
+  // End marker — send as a regular chunk so the Pi's stream parser sees it
+  uint32_t end_marker = 0xFFFFFFFF;
+  writeChunk((uint8_t*)&end_marker, 4);
+
+  // HTTP/1.1 chunked body terminator: zero-length chunk = "0\r\n\r\n"
+  client.print("0\r\n\r\n");
+  client.flush();
+
+  client.stop();
+  Serial.println("[Clip] Clip sent");
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // ── IMPORTANT: initCamera() and initI2S() were missing from setup() ────────
+  // These must come before WiFi so they grab their GPIO before WiFi steals PSRAM
+  if (!initCamera()) {
+    Serial.println("Camera init failed — halting");
+    while (true) delay(1000);
+  }
+
+  if (!initI2S()) {
+    Serial.println("I2S init failed — halting");
+    while (true) delay(1000);
+  }
+
+  pinMode(PIR_PIN, INPUT);
+  dht.begin();
+
+  Serial.print("Connecting to WiFi");
+  connectWiFi();
+
+  delay(2000);   // DHT22 needs ~2 s after power-up
+  sendSensorData();
+  lastSensorSend = millis();
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+void loop() {
+  unsigned long now = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost — reconnecting...");
+    connectWiFi();
+  }
+
+  if (digitalRead(PIR_PIN) == HIGH) {
+    if (!motionActive && (now - lastMotionTime > MOTION_COOLDOWN)) {
+      motionActive   = true;
+      lastMotionTime = now;
+      captureAndSendClip();
+      motionActive = false;
+    }
+  }
+
+  if (now - lastSensorSend >= SENSOR_INTERVAL) {
+    sendSensorData();
+    lastSensorSend = now;
+  }
+
+  delay(50);
+}
