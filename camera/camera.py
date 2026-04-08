@@ -1,372 +1,400 @@
 #!/usr/bin/env python3
-"""
-Raspberry Pi 5 Live Camera with Roboflow CCTV Person Detection
-OV5647 ArduCam with Day/Night modes - Custom Model Support
-"""
+
 from dotenv import load_dotenv
+load_dotenv()
+
 import cv2
 import time
 import requests
 import base64
-from picamera2 import Picamera2
 import numpy as np
 from io import BytesIO
 from PIL import Image
 import os
 import threading
-import RPi.GPIO as GPIO
-import time
-import serial
+import struct
 from math import log10
+from flask import Flask, request, jsonify
 
-ser= serial.Serial('/dev/ttyACM0', 9600, timeout=1)
-time.sleep(2)
-
-interval = 300
-
-def binary_to_DB(binary_string):
-    decimal_value = int(binary_string, 2)
-   
-    voltage = decimal_value * (5.0 / 1023.0)
-   
-    if voltage < 0.001:
-        voltage = 0.001
-       
-    db = 20 * log10(voltage / 0.00631)
-   
-    if db < 0:
-        db = 0
-    if db > 120:
-        db = 120
-       
-    return db
-
-   
-
-SERVER_URL = os.getenv("SERVER_URL")
+# ── Dashboard server ──────────────────────────────────────────────────────────
+SERVER_URL     = os.getenv("SERVER_URL")
 CAMERA_API_KEY = os.getenv("CAMERA_API_KEY")
 
-# Roboflow API Configuration
-API_URL = os.getenv("API_URL")
-API_KEY =  os.getenv("API_KEY")
+# ── Roboflow ──────────────────────────────────────────────────────────────────
+API_URL = os.getenv("https://serverless.roboflow.com/people-detection-o4rdr/12")
+API_KEY = os.getenv("H7235hFO9pR0ET91ohz0")
 
-# Configuration
-DISPLAY_WINDOW = True  # Set to False if running headless
-INFERENCE_INTERVAL = 0.5  # Seconds between API calls
-CONFIDENCE_THRESHOLD = 0.5  # Minimum confidence to display detections
+# ── Flask (receives data FROM the ESP32) ──────────────────────────────────────
+FLASK_HOST = "0.0.0.0"
+FLASK_PORT = int(os.getenv("24.208.193.184", "5000"))  
 
-# Virtual line configurationq
-LINE_POSITION = 320  # X position of vertical line (center of 640px frame)
-CROSSING_THRESHOLD = 30  # Pixels object must cross to register
+# ── General config ────────────────────────────────────────────────────────────
+DISPLAY_WINDOW       = True
+CONFIDENCE_THRESHOLD = 0.5
+SEND_INTERVAL        = 300   # seconds between server posts
 
-# Tracking
-tracked_objects = {}  # Store object positions
-inside_count = 0  # Count of objects currently inside
+# ── Virtual line ──────────────────────────────────────────────────────────────
+LINE_POSITION      = 320
+CROSSING_THRESHOLD = 30
 
-# Camera modes
-NIGHT_MODE = {
-    "AeEnable": True,
-    "AwbEnable": False,
-    "ExposureTime": 33000,
-    "AnalogueGain": 8.0,
-    "Brightness": 0.1,
-    "Contrast": 1.2,
-    "Saturation": 0.8
-}
+# ── Shared state (written by Flask threads, read by display thread) ───────────
+tracked_objects  = {}
+inside_count     = 0
+latest_db        = 0.0
+latest_temp_c    = None
+latest_humidity  = None
+latest_frame     = None          # most recent decoded JPEG from ESP32
+latest_preds     = None          # most recent Roboflow result
+state_lock       = threading.Lock()
 
-DAY_MODE = {
-    "AeEnable": True,
-    "AwbEnable": True,
-    "ExposureTime": 20000,
-    "AnalogueGain": 4.0,
-    "Brightness": 0.2,
-    "Contrast": 1.1,
-    "Saturation": 1.0
-}
+app = Flask(__name__)
 
-def setup_camera(mode="day"):
-    """Initialize ArduCam OV5647 with selectable day/night settings"""
-    picam2 = Picamera2()
 
-    # List available cameras (helpful for debugging)
-    cameras = picam2.global_camera_info()
-    print(f"Available cameras: {cameras}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Flask routes — ESP32 pushes data here
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Select mode settings
-    controls = NIGHT_MODE if mode == "night" else DAY_MODE
+@app.route("/sensor", methods=["POST"])
+def sensor():
+    """Receive DHT22 temperature + humidity from ESP32."""
+    global latest_temp_c, latest_humidity
+    data = request.get_json(force=True, silent=True) or {}
+    temp = data.get("temperature")
+    hum  = data.get("humidity")
+    if temp is not None and hum is not None:
+        with state_lock:
+            latest_temp_c  = float(temp)
+            latest_humidity = float(hum)
+        print(f"[Sensor] Temp: {temp}°C  Hum: {hum}%")
+    return jsonify({"status": "ok"}), 200
 
-    # Configure for OV5647
-    config = picam2.create_preview_configuration(
-        main={"size": (640, 480)},
-        controls=controls
-    )
-    picam2.configure(config)
-    picam2.start()
-    time.sleep(3)  # Allow camera to warm up and adjust to lighting
-    print(f"OV5647 ArduCam initialized in {mode.upper()} mode")
-    return picam2
 
-def switch_camera_mode(picam2, mode):
-    """Switch between day and night mode"""
-    controls = NIGHT_MODE if mode == "night" else DAY_MODE
-    picam2.set_controls(controls)
-    print(f"Switched to {mode.upper()} mode")
-    return mode
+@app.route("/motion_clip", methods=["POST"])
+def motion_clip():
+    """
+    Receive interleaved MJPEG + I2S audio stream from ESP32.
+
+    Binary wire format (matches ESP32 sketch exactly):
+        [4 bytes LE uint32 frame_len] [frame_len bytes JPEG]
+        [4 bytes LE uint32 audio_len] [audio_len bytes int32 PCM]
+        ... repeating ...
+        [4 bytes 0xFFFFFFFF]  ← end marker
+
+    IMPORTANT: Flask/Werkzeug buffers request.stream by default.
+    We access wsgi.input directly and set stream_factory to avoid buffering.
+    The app must be run with use_reloader=False and threaded=True.
+    """
+    global latest_frame, latest_db, latest_preds
+
+    # Read directly from the WSGI input — avoids Werkzeug's content-length buffering
+    raw = request.environ.get("wsgi.input")
+    if raw is None:
+        return jsonify({"error": "no wsgi.input"}), 400
+
+    buf = b""
+
+    def read_bytes(n):
+        """Read exactly n bytes from the raw WSGI stream, buffering across TCP packets."""
+        nonlocal buf
+        while len(buf) < n:
+            try:
+                chunk = raw.read(min(8192, n - len(buf)))
+            except Exception:
+                return None
+            if not chunk:
+                return None
+            buf += chunk
+        out, buf = buf[:n], buf[n:]
+        return out
+
+    print("[Clip] Motion clip started")
+    last_inference_time = 0.0
+    INFERENCE_INTERVAL  = 0.5   # max one Roboflow call per 500 ms during a clip
+
+    while True:
+        hdr = read_bytes(4)
+        if hdr is None or len(hdr) < 4:
+            print("[Clip] Stream ended unexpectedly")
+            break
+
+        length = struct.unpack("<I", hdr)[0]
+
+        if length == 0xFFFFFFFF:
+            print("[Clip] End marker received")
+            break
+
+        if length == 0 or length > 200_000:
+            print(f"[Clip] Implausible length {length} — stream likely desynced, aborting")
+            break
+
+        payload = read_bytes(length)
+        if payload is None:
+            break
+
+        if payload[:2] == b'\xff\xd8':
+            # ── JPEG video frame ──────────────────────────────────────────────
+            img_array = np.frombuffer(payload, dtype=np.uint8)
+            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            if frame is not None:
+                with state_lock:
+                    latest_frame = frame.copy()
+
+                # Throttle Roboflow calls — inference is slower than 10fps
+                now = time.time()
+                if now - last_inference_time >= INFERENCE_INTERVAL:
+                    preds = run_inference(frame)
+                    last_inference_time = now
+                    if preds:
+                        # Hold lock for the shortest possible window
+                        with state_lock:
+                            latest_preds = preds
+                        # check_line_crossing needs state_lock too — call outside
+                        check_line_crossing(preds)
+        else:
+            # ── I2S audio chunk (int32 → shift to 16-bit range for dB) ────────
+            if len(payload) >= 4:
+                samples_32 = np.frombuffer(payload, dtype=np.int32)
+                # INMP441 data sits in the top 24 bits of the 32-bit I2S frame;
+                # arithmetic right-shift by 8 preserves sign, gives 24-bit values
+                # then scale to float for RMS (don't cast to int16 — clips signal)
+                samples_f = (samples_32.astype(np.int64) >> 8).astype(np.float32)
+                rms = np.sqrt(np.mean(samples_f ** 2)) if len(samples_f) > 0 else 0.0
+                if rms > 0:
+                    # Normalise against 24-bit full scale (2^23)
+                    db = 20 * log10(rms / 8_388_608.0) + 120
+                    db = max(0.0, min(120.0, db))
+                    with state_lock:
+                        latest_db = db
+
+    print("[Clip] Motion clip complete")
+    return jsonify({"status": "ok"}), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Roboflow inference
+# ─────────────────────────────────────────────────────────────────────────────
 
 def frame_to_base64(frame):
-    """Convert frame to base64 for API upload - handles OV5647 color format"""
-    # Frame comes in as RGB from picamera2, convert to proper format for PIL
     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-    # Save to bytes buffer
     buffered = BytesIO()
     pil_image.save(buffered, format="JPEG", quality=85)
+    return base64.b64encode(buffered.getvalue()).decode()
 
-    # Encode to base64
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    return img_str
 
 def run_inference(frame):
-    """Send frame to Roboflow API and get predictions"""
     try:
         img_base64 = frame_to_base64(frame)
         response = requests.post(
             API_URL,
-            params={
-                "api_key": API_KEY,
-                "confidence": int(CONFIDENCE_THRESHOLD * 100)
-            },
+            params={"api_key": API_KEY, "confidence": int(CONFIDENCE_THRESHOLD * 100)},
             data=img_base64,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
-            timeout=5
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=5,
         )
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"API Error: {response.status_code} - {response.text}")
-            return None
-    except requests.exceptions.Timeout:
-        print("API request timed out")
-        return None
+        return response.json() if response.status_code == 200 else None
     except Exception as e:
-        print(f"Inference error: {e}")
+        print(f"[Roboflow] Error: {e}")
         return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Drawing helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def draw_detections(frame, predictions):
-    """Draw bounding boxes and labels on frame"""
-    if not predictions or 'predictions' not in predictions:
+    if not predictions or "predictions" not in predictions:
         return frame
-
-    for pred in predictions['predictions']:
-        x = int(pred['x'] - pred['width'] / 2)
-        y = int(pred['y'] - pred['height'] / 2)
-        w = int(pred['width'])
-        h = int(pred['height'])
-        center_x = int(pred['x'])
-        center_y = int(pred['y'])
-
-        confidence = pred['confidence']
-        label = pred.get('class', 'detection')
-
-        if confidence >= CONFIDENCE_THRESHOLD:
-            # Draw bounding box
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-            # Draw center point
-            cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
-
-            # Draw label with confidence
-            label_text = f"{label}: {confidence:.2f}"
-            label_size, _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(frame, (x, y - label_size[1] - 10),
-                         (x + label_size[0], y), (0, 255, 0), -1)
-            cv2.putText(frame, label_text, (x, y - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-
+    for pred in predictions["predictions"]:
+        if pred["confidence"] < CONFIDENCE_THRESHOLD:
+            continue
+        x  = int(pred["x"] - pred["width"]  / 2)
+        y  = int(pred["y"] - pred["height"] / 2)
+        w  = int(pred["width"])
+        h  = int(pred["height"])
+        cx = int(pred["x"])
+        cy = int(pred["y"])
+        label = f"{pred.get('class', 'object')}: {pred['confidence']:.2f}"
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
+        lsz, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        cv2.rectangle(frame, (x, y - lsz[1] - 10), (x + lsz[0], y), (0, 255, 0), -1)
+        cv2.putText(frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
     return frame
 
-def check_line_crossing(predictions):
-    """Check if objects crossed the virtual line and update count"""
-    global tracked_objects, inside_count
-
-    if not predictions or 'predictions' not in predictions:
-        return
-
-    current_frame_ids = set()
-
-    for pred in predictions['predictions']:
-        if pred['confidence'] < CONFIDENCE_THRESHOLD:
-            continue
-
-        # Use center of bounding box
-        center_x = int(pred['x'])
-        center_y = int(pred['y'])
-        obj_class = pred.get('class', 'object')
-
-        # Create unique ID based on position and class
-        obj_id = f"{obj_class}_{center_y // 50}"  # Group by vertical region
-        current_frame_ids.add(obj_id)
-
-        # Check if object was tracked before
-        if obj_id in tracked_objects:
-            prev_x = tracked_objects[obj_id]
-
-            # Check for crossing from left to right (ENTERING)
-            if prev_x < LINE_POSITION - CROSSING_THRESHOLD and center_x > LINE_POSITION + CROSSING_THRESHOLD:
-                inside_count += 1
-                print(f">>> {obj_class} ENTERED | Inside count: {inside_count}")
-
-            # Check for crossing from right to left (EXITING)
-            elif prev_x > LINE_POSITION + CROSSING_THRESHOLD and center_x < LINE_POSITION - CROSSING_THRESHOLD:
-                inside_count = max(0, inside_count - 1)
-                print(f"<<< {obj_class} EXITED | Inside count: {inside_count}")
-
-        # Update position
-        tracked_objects[obj_id] = center_x
-
-    # Clean up objects no longer detected (timeout after 2 seconds worth of frames)
-    # Keep tracked_objects small by removing old entries
-    ids_to_remove = [oid for oid in tracked_objects if oid not in current_frame_ids]
-    for oid in ids_to_remove[:max(0, len(ids_to_remove) - 10)]:  # Keep last 10
-        del tracked_objects[oid]
 
 def draw_virtual_line(frame):
-    """Draw the virtual detection line on frame"""
-    height = frame.shape[0]
-
-    # Draw vertical line
-    cv2.line(frame, (LINE_POSITION, 0), (LINE_POSITION, height), (255, 0, 0), 3)
-
-    # Draw arrows showing direction
-    # Left arrow (OUT)
+    h = frame.shape[0]
+    cv2.line(frame, (LINE_POSITION, 0), (LINE_POSITION, h), (255, 0, 0), 3)
     cv2.arrowedLine(frame, (LINE_POSITION - 40, 50), (LINE_POSITION - 10, 50), (0, 0, 255), 2)
     cv2.putText(frame, "OUT", (LINE_POSITION - 80, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-    # Right arrow (IN)
     cv2.arrowedLine(frame, (LINE_POSITION + 10, 50), (LINE_POSITION + 40, 50), (0, 255, 0), 2)
-    cv2.putText(frame, "IN", (LINE_POSITION + 50, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
+    cv2.putText(frame, "IN",  (LINE_POSITION + 50, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     return frame
 
-def send_to_server(count, avg_sound_level):
+
+def draw_sensor_overlay(frame, temp_c, humidity, db):
+    y = frame.shape[0] - 15
+    temp_f   = (temp_c * 9 / 5 + 32) if temp_c is not None else None
+    temp_str = f"Temp: {temp_c:.1f}C / {temp_f:.1f}F" if temp_c is not None else "Temp: --"
+    hum_str  = f"Hum: {humidity:.1f}%" if humidity is not None else "Hum: --"
+    db_str   = f"Sound: {db:.1f} dB"
+    cv2.putText(frame, f"  {temp_str}   {hum_str}   {db_str}  ",
+                (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+    return frame
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Line crossing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_line_crossing(predictions):
+    global tracked_objects, inside_count
+    if not predictions or "predictions" not in predictions:
+        return
+    current_ids = set()
+    for pred in predictions["predictions"]:
+        if pred["confidence"] < CONFIDENCE_THRESHOLD:
+            continue
+        cx  = int(pred["x"])
+        cy  = int(pred["y"])
+        cls = pred.get("class", "object")
+        oid = f"{cls}_{cy // 50}"
+        current_ids.add(oid)
+        if oid in tracked_objects:
+            prev_x = tracked_objects[oid]
+            if prev_x < LINE_POSITION - CROSSING_THRESHOLD and cx > LINE_POSITION + CROSSING_THRESHOLD:
+                inside_count += 1
+                print(f">>> {cls} ENTERED | Inside: {inside_count}")
+            elif prev_x > LINE_POSITION + CROSSING_THRESHOLD and cx < LINE_POSITION - CROSSING_THRESHOLD:
+                inside_count = max(0, inside_count - 1)
+                print(f"<<< {cls} EXITED  | Inside: {inside_count}")
+        tracked_objects[oid] = cx
+    stale = [oid for oid in tracked_objects if oid not in current_ids]
+    for oid in stale[: max(0, len(stale) - 10)]:
+        del tracked_objects[oid]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Periodic server post
+# ─────────────────────────────────────────────────────────────────────────────
+
+def send_to_server(count, avg_db, temp_c, humidity):
     try:
-        response = requests.post(
+        payload = {
+            "buildingId":  "Example Location",
+            "count":       count,
+            "soundLevel":  avg_db,
+            "temperature": temp_c,
+            "humidity":    humidity,
+        }
+        resp = requests.post(
             SERVER_URL,
             headers={"x-api-key": CAMERA_API_KEY, "Content-Type": "application/json"},
-            json={"buildingId": "Example Location", "count": count, "soundLevel": avg_sound_level}
+            json=payload,
+            timeout=5,
         )
-        print(f"Posted to server: {response.status_code}")
+        print(f"[Server] Posted → {resp.status_code} | {payload}")
     except Exception as e:
-        print(f"Failed to post to server: {e}")
+        print(f"[Server] Post failed: {e}")
 
-def periodic_send(interval):
-    """Send the current inside_count to the server every `interval` seconds."""
+
+def periodic_send():
     while True:
-        current_time = time.time()
-        end_time = current_time + interval
-        db_readings = []
-        while end_time > time.time():
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8').strip()
-                try:
-                    db_value = float(f'{binary_to_DB(line):.2f}')
-                    db_readings.append(db_value)
-                except ValueError:
-                    pass
-            time.sleep(0.1)
-           
-        send_to_server(inside_count, sum(db_readings) / max(len(db_readings), 1))
-       
-def main():
-    """Update server every interval"""
-    threading.Thread(target=periodic_send, args=(interval,), daemon=True).start()
-    """Main loop for camera capture and inference"""
-    print("Starting Raspberry Pi 5 CCTV Detection")
-    print(f"Model: {API_URL}")
-    print(f"Inference interval: {INFERENCE_INTERVAL}s")
-    print("\nControls:")
-    print("  Press 'N' - Switch to NIGHT mode")
-    print("  Press 'D' - Switch to DAY mode")
-    print("  Press 'Q' - Quit\n")
+        time.sleep(SEND_INTERVAL)
+        with state_lock:
+            count    = inside_count
+            db       = latest_db
+            temp_c   = latest_temp_c
+            humidity = latest_humidity
+        send_to_server(count, db, temp_c, humidity)
 
-    # Initialize camera in day mode (normal colors)
-    picam2 = setup_camera(mode="day")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Display loop (runs in main thread)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def display_loop():
+    """Show the latest frame received from ESP32 with overlays."""
+    frame_count  = 0
     current_mode = "day"
 
-    last_inference_time = 0
-    latest_predictions = None
-    frame_count = 0
+    while True:
+        with state_lock:
+            frame    = latest_frame.copy() if latest_frame is not None else None
+            preds    = latest_preds
+            db       = latest_db
+            temp_c   = latest_temp_c
+            humidity = latest_humidity
 
-
-    try:
-        while True:
-            # Capture frame from camera
-            frame = picam2.capture_array()
-
-            # Fix color channels for OV5647 - convert RGB to BGR for OpenCV
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        if frame is None:
+            # Show placeholder while waiting for first clip
+            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(placeholder, "Waiting for ESP32-CAM...", (120, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+            cv2.imshow("CCTV Detection System", placeholder)
+        else:
             frame_count += 1
-
-            # Run inference at specified intervals
-            current_time = time.time()
-            if current_time - last_inference_time >= INFERENCE_INTERVAL:
-                print(f"Running inference on frame {frame_count}...")
-                latest_predictions = run_inference(frame)
-                if latest_predictions and 'predictions' in latest_predictions:
-                    num_detections = len(latest_predictions['predictions'])
-                    print(f"  Detected {num_detections} object(s)")
-                    for i, pred in enumerate(latest_predictions['predictions'], 1):
-                        conf = pred['confidence']
-                        cls = pred.get('class', 'object')
-                        print(f"    {i}. {cls} (confidence: {conf:.2f})")
-
-                    # Check for line crossings
-                    check_line_crossing(latest_predictions)
-
-                last_inference_time = current_time
-
-            # Draw virtual line
             frame = draw_virtual_line(frame)
+            if preds:
+                frame = draw_detections(frame, preds)
+            frame = draw_sensor_overlay(frame, temp_c, humidity, db)
+            status = f"Frame:{frame_count} | Inside:{inside_count} | Mode:{current_mode.upper()}"
+            cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.imshow("CCTV Detection System", frame)
 
-            # Draw detections on frame
-            if latest_predictions:
-                frame = draw_detections(frame, latest_predictions)
+        key = cv2.waitKey(30) & 0xFF
+        if key in (ord("q"), ord("Q")):
+            print("\nQuitting...")
+            break
+        elif key in (ord("n"), ord("N")):
+            current_mode = "night"
+        elif key in (ord("d"), ord("D")):
+            current_mode = "day"
 
-            # Add frame counter and status
-            fps_text = f"Frame: {frame_count} | Mode: {current_mode.upper()} | Inside: {inside_count}"
-            cv2.putText(frame, fps_text, (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    cv2.destroyAllWindows()
 
-            status_text = "Analyzing..." if (current_time - last_inference_time < 0.1) else "Monitoring"
-            cv2.putText(frame, status_text, (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            # Display frame if enabled
-            if DISPLAY_WINDOW:
-                cv2.imshow('CCTV Detection System', frame)
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
-                # Check for keyboard commands
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == ord('Q'):
-                    print("\nQuitting...")
-                    break
-                elif key == ord('n') or key == ord('N'):
-                    current_mode = switch_camera_mode(picam2, "night")
-                elif key == ord('d') or key == ord('D'):
-                    current_mode = switch_camera_mode(picam2, "day")
-            else:
-                time.sleep(0.01)
+def main():
+    print("Starting ESP32-CAM CCTV receiver")
+    print(f"  Flask port : {FLASK_PORT}  (ESP32 must point PI_PORT here)")
+    print(f"  Roboflow   : {API_URL}")
+    print(f"  Send every : {SEND_INTERVAL}s\n")
 
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
+    # Allow large clip uploads (10s @ 10fps VGA JPEG ≈ 10–30 MB)
+    app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB hard cap
 
-    finally:
-        picam2.stop()
-        if DISPLAY_WINDOW:
-            cv2.destroyAllWindows()
-        print("Camera stopped and resources cleaned up")
+    # Flask runs in a background thread so display loop owns the main thread.
+    # use_reloader=False is required when Flask is not in the main thread.
+    # threaded=True lets /sensor and /motion_clip be handled concurrently.
+    threading.Thread(
+        target=lambda: app.run(
+            host=FLASK_HOST,
+            port=FLASK_PORT,
+            threaded=True,
+            use_reloader=False,
+        ),
+        daemon=True
+    ).start()
+
+    threading.Thread(target=periodic_send, daemon=True).start()
+
+    if DISPLAY_WINDOW:
+        display_loop()
+    else:
+        # Headless — just keep alive
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+
+    print("Stopped.")
+
 
 if __name__ == "__main__":
     main()
+
