@@ -8,7 +8,7 @@
 // ── Setup ─────────────────────────────────────────────────────────────────────
 const char* SSID     = "Eagle’s Nest";
 const char* PASSWORD = "rrf43078";
-const char* PI_IP    = "192.168.68.119";   // ← fill in your Pi's IP
+const char* PI_IP    = "192.168.68.119";  
 const int   PI_PORT  = 5000;
 
 #define PIR_PIN 13
@@ -16,16 +16,16 @@ const int   PI_PORT  = 5000;
 
 // INMP441 I2S mic pins
 #define I2S_WS  15
-#define I2S_SD  12   // GPIO12 must be LOW at boot — see note below
+#define I2S_SD  12   // GPIO12 must be LOW at boot 
 #define I2S_SCK 2
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 #define DHT_TYPE         DHT22
-#define CLIP_DURATION_MS 60000   // 10 second clip on motion
+#define CLIP_DURATION_MS 10000   // 10 second clip on motion
 #define FRAME_DELAY_MS   100     // ~10 fps
 #define SAMPLE_RATE      16000
 #define SENSOR_INTERVAL  600000  // 10 minutes
-#define MOTION_COOLDOWN  000    // 8 seconds before re-arming PIR
+#define MOTION_COOLDOWN  5000    // 8 seconds before re-arming PIR
 
 // ── ESP32-CAM AI-Thinker pinout ───────────────────────────────────────────────
 #define PWDN_GPIO_NUM  32
@@ -97,17 +97,11 @@ bool initCamera() {
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NOTE on GPIO12: the INMP441 DATA pin is on GPIO12, which is a boot-strapping
-// pin on the ESP32. It must be LOW at boot or the board won't start. This is
-// fine as long as nothing pulls it HIGH during power-up (INMP441 DATA is Hi-Z
-// until the I2S clock starts, so it's normally fine in practice).
-// ─────────────────────────────────────────────────────────────────────────────
 bool initI2S() {
   i2s_config_t i2s_config = {
     .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate          = SAMPLE_RATE,
-    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,  // INMP441 outputs 24-bit in 32-bit frame
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT, 
     .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_I2S_MSB,
     .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
@@ -178,26 +172,17 @@ void sendSensorData() {
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Wire format (must match Pi receiver exactly):
-//   [4-byte LE uint32 = payload_len] [payload_len bytes]
-//   payload is JPEG if it starts with FFD8, otherwise int32 PCM audio
-//   [4-byte 0xFFFFFFFF] = end of clip
-// ─────────────────────────────────────────────────────────────────────────────
 void captureAndSendClip() {
   Serial.println("[Clip] Motion detected — sending clip");
 
-  const uint32_t AUDIO_SAMPLES = 512;  // samples per audio packet
+  const uint32_t AUDIO_SAMPLES = 512;  
 
-  // Raw WiFiClient for streaming POST — HTTPClient buffers the body,
-  // which doesn't work for a 10-second interleaved video+audio stream.
   WiFiClient client;
   if (!client.connect(PI_IP, PI_PORT)) {
     Serial.println("[Clip] Could not connect to Pi");
     return;
   }
 
-  // Send raw HTTP POST headers manually so we can stream the body
   client.println("POST /motion_clip HTTP/1.1");
   client.println("Host: " + String(PI_IP) + ":" + String(PI_PORT));
   client.println("Content-Type: application/octet-stream");
@@ -207,19 +192,18 @@ void captureAndSendClip() {
   client.println();
 
   auto writeChunk = [&](const uint8_t* data, size_t len) {
-    // HTTP/1.1 chunked encoding: "<hex-len>\r\n<data>\r\n"
-    // Write size line
+
     char sizeLine[12];
     snprintf(sizeLine, sizeof(sizeLine), "%X\r\n", (unsigned int)len);
     client.print(sizeLine);
-    // Write data
+
     size_t sent = 0;
     while (sent < len) {
       size_t batch = min((size_t)1024, len - sent);
       client.write(data + sent, batch);
       sent += batch;
     }
-    // Write trailing CRLF (marks end of this chunk's data)
+
     client.print("\r\n");
   };
 
@@ -230,13 +214,9 @@ void captureAndSendClip() {
     // ── Video frame ───────────────────────────────────────────────────────────
     camera_fb_t* fb = esp_camera_fb_get();
     if (fb) {
-      // Send length prefix (4 bytes) + JPEG payload as one contiguous chunk
-      // so the Pi's stream reader sees [len][JPEG] without HTTP framing in between
+
       uint32_t flen = (uint32_t)fb->len;
 
-      // Build a single buffer: 4-byte LE length + JPEG bytes
-      // Sending them as two separate writeChunk() calls would insert
-      // HTTP chunk boundaries between them, confusing the length-prefix parser.
       size_t   totalLen = 4 + fb->len;
       uint8_t* frameBuf = (uint8_t*)malloc(totalLen);
       if (frameBuf) {
@@ -254,7 +234,7 @@ void captureAndSendClip() {
     i2s_read(I2S_NUM_1, audioBuffer, sizeof(audioBuffer), &bytesRead, pdMS_TO_TICKS(50));
 
     if (bytesRead > 0) {
-      // Same approach: send length prefix + raw PCM in one chunk
+
       uint32_t alen     = (uint32_t)bytesRead;
       size_t   totalLen = 4 + bytesRead;
       uint8_t* audioBuf = (uint8_t*)malloc(totalLen);
@@ -269,11 +249,10 @@ void captureAndSendClip() {
     delay(FRAME_DELAY_MS);
   }
 
-  // End marker — send as a regular chunk so the Pi's stream parser sees it
+
   uint32_t end_marker = 0xFFFFFFFF;
   writeChunk((uint8_t*)&end_marker, 4);
 
-  // HTTP/1.1 chunked body terminator: zero-length chunk = "0\r\n\r\n"
   client.print("0\r\n\r\n");
   client.flush();
 
@@ -287,8 +266,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // ── IMPORTANT: initCamera() and initI2S() were missing from setup() ────────
-  // These must come before WiFi so they grab their GPIO before WiFi steals PSRAM
+
   if (!initCamera()) {
     Serial.println("Camera init failed — halting");
     while (true) delay(1000);
