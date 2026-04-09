@@ -13,57 +13,70 @@ from PIL import Image
 import os
 import threading
 import struct
+import gc
 from math import log10
 from flask import Flask, request, jsonify
+from datetime import datetime
 
 # ── Dashboard server ──────────────────────────────────────────────────────────
 SERVER_URL     = os.getenv("SERVER_URL")
 CAMERA_API_KEY = os.getenv("CAMERA_API_KEY")
 
 # ── Roboflow ──────────────────────────────────────────────────────────────────
-API_URL = os.getenv("https://serverless.roboflow.com/people-detection-o4rdr/12")
-API_KEY = os.getenv("H7235hFO9pR0ET91ohz0")
+API_URL = "https://serverless.roboflow.com/ped-ttjij/2"
+API_KEY = "H7235hFO9pR0ET91ohz0"
 
 # ── Flask (receives data FROM the ESP32) ──────────────────────────────────────
 FLASK_HOST = "0.0.0.0"
-FLASK_PORT = int(os.getenv("24.208.193.184", "5000"))  
+FLASK_PORT = 5000
 
 # ── General config ────────────────────────────────────────────────────────────
 DISPLAY_WINDOW       = True
 CONFIDENCE_THRESHOLD = 0.5
-SEND_INTERVAL        = 300   # seconds between server posts
+SEND_INTERVAL        = 300        # seconds between server posts
+CLIPS_DIR            = "clips"    # folder where .avi clips are saved
+CLIP_FPS             = 10         # must match ESP32 FRAME_DELAY_MS (100ms = 10fps)
 
 # ── Virtual line ──────────────────────────────────────────────────────────────
-LINE_POSITION      = 320
+LINE_VISIBLE       = True
+LINE_ORIENTATION   = "vertical"   # "vertical" or "horizontal"
+LINE_POSITION      = 320          # X pixel for vertical, Y pixel for horizontal
 CROSSING_THRESHOLD = 30
+LINE_COLOR         = (255, 0, 0)  # BGR
+LINE_THICKNESS     = 3
 
-# ── Shared state (written by Flask threads, read by display thread) ───────────
+# ── Shared state ──────────────────────────────────────────────────────────────
 tracked_objects  = {}
 inside_count     = 0
 latest_db        = 0.0
 latest_temp_c    = None
 latest_humidity  = None
-latest_frame     = None          # most recent decoded JPEG from ESP32
-latest_preds     = None          # most recent Roboflow result
+latest_frame     = None       # live frame during a clip
+latest_preds     = None
+frame_ready      = False
+clip_playing     = False      # True while replaying a saved clip
+clip_queue       = []         # paths of saved clips waiting to be played
 state_lock       = threading.Lock()
+clip_queue_lock  = threading.Lock()
+
+os.makedirs(CLIPS_DIR, exist_ok=True)
 
 app = Flask(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Flask routes — ESP32 pushes data here
+# Flask routes
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/sensor", methods=["POST"])
 def sensor():
-    """Receive DHT22 temperature + humidity from ESP32."""
     global latest_temp_c, latest_humidity
     data = request.get_json(force=True, silent=True) or {}
     temp = data.get("temperature")
     hum  = data.get("humidity")
     if temp is not None and hum is not None:
         with state_lock:
-            latest_temp_c  = float(temp)
+            latest_temp_c   = float(temp)
             latest_humidity = float(hum)
         print(f"[Sensor] Temp: {temp}°C  Hum: {hum}%")
     return jsonify({"status": "ok"}), 200
@@ -72,21 +85,17 @@ def sensor():
 @app.route("/motion_clip", methods=["POST"])
 def motion_clip():
     """
-    Receive interleaved MJPEG + I2S audio stream from ESP32.
+    Receive interleaved MJPEG + I2S audio stream from ESP32, save to disk,
+    then queue for playback once the clip is complete.
 
-    Binary wire format (matches ESP32 sketch exactly):
+    Binary wire format:
         [4 bytes LE uint32 frame_len] [frame_len bytes JPEG]
         [4 bytes LE uint32 audio_len] [audio_len bytes int32 PCM]
         ... repeating ...
-        [4 bytes 0xFFFFFFFF]  ← end marker
-
-    IMPORTANT: Flask/Werkzeug buffers request.stream by default.
-    We access wsgi.input directly and set stream_factory to avoid buffering.
-    The app must be run with use_reloader=False and threaded=True.
+        [4 bytes 0xFFFFFFFF]  <- end marker
     """
-    global latest_frame, latest_db, latest_preds
+    global latest_frame, latest_db, latest_preds, frame_ready
 
-    # Read directly from the WSGI input — avoids Werkzeug's content-length buffering
     raw = request.environ.get("wsgi.input")
     if raw is None:
         return jsonify({"error": "no wsgi.input"}), 400
@@ -94,7 +103,6 @@ def motion_clip():
     buf = b""
 
     def read_bytes(n):
-        """Read exactly n bytes from the raw WSGI stream, buffering across TCP packets."""
         nonlocal buf
         while len(buf) < n:
             try:
@@ -107,9 +115,14 @@ def motion_clip():
         out, buf = buf[:n], buf[n:]
         return out
 
-    print("[Clip] Motion clip started")
+    # ── Prepare video writer ──────────────────────────────────────────────────
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    clip_path  = os.path.join(CLIPS_DIR, f"clip_{timestamp}.avi")
+    writer     = None   # initialised on first frame so we know the frame size
+
+    print(f"[Clip] Motion clip started → {clip_path}")
     last_inference_time = 0.0
-    INFERENCE_INTERVAL  = 0.5   # max one Roboflow call per 500 ms during a clip
+    INFERENCE_INTERVAL  = 0.5
 
     while True:
         hdr = read_bytes(4)
@@ -124,7 +137,7 @@ def motion_clip():
             break
 
         if length == 0 or length > 200_000:
-            print(f"[Clip] Implausible length {length} — stream likely desynced, aborting")
+            print(f"[Clip] Implausible length {length} — aborting")
             break
 
         payload = read_bytes(length)
@@ -132,41 +145,68 @@ def motion_clip():
             break
 
         if payload[:2] == b'\xff\xd8':
-            # ── JPEG video frame ──────────────────────────────────────────────
+            # ── JPEG frame ────────────────────────────────────────────────────
             img_array = np.frombuffer(payload, dtype=np.uint8)
             frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
             if frame is not None:
-                with state_lock:
-                    latest_frame = frame.copy()
 
-                # Throttle Roboflow calls — inference is slower than 10fps
+                # Initialise writer on first frame so we know the resolution
+                if writer is None:
+                    h, w   = frame.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                    writer = cv2.VideoWriter(clip_path, fourcc, CLIP_FPS, (w, h))
+                    print(f"[Clip] Writer opened: {w}x{h} @ {CLIP_FPS}fps")
+
+                # Draw overlays onto the frame before saving so the clip is annotated
+                annotated = frame.copy()
+                annotated = draw_virtual_line(annotated)
+                with state_lock:
+                    preds_snap = latest_preds
+                if preds_snap:
+                    annotated = draw_detections(annotated, preds_snap)
+                with state_lock:
+                    tc = latest_temp_c
+                    hm = latest_humidity
+                    db = latest_db
+                annotated = draw_sensor_overlay(annotated, tc, hm, db)
+                writer.write(annotated)
+
+                # Update live preview — drop frame if display hasn't caught up
+                with state_lock:
+                    if not frame_ready:
+                        latest_frame = annotated.copy()
+                        frame_ready  = True
+
+                # Roboflow inference
                 now = time.time()
                 if now - last_inference_time >= INFERENCE_INTERVAL:
                     preds = run_inference(frame)
                     last_inference_time = now
                     if preds:
-                        # Hold lock for the shortest possible window
                         with state_lock:
                             latest_preds = preds
-                        # check_line_crossing needs state_lock too — call outside
                         check_line_crossing(preds)
         else:
-            # ── I2S audio chunk (int32 → shift to 16-bit range for dB) ────────
+            # ── I2S audio chunk ───────────────────────────────────────────────
             if len(payload) >= 4:
                 samples_32 = np.frombuffer(payload, dtype=np.int32)
-                # INMP441 data sits in the top 24 bits of the 32-bit I2S frame;
-                # arithmetic right-shift by 8 preserves sign, gives 24-bit values
-                # then scale to float for RMS (don't cast to int16 — clips signal)
-                samples_f = (samples_32.astype(np.int64) >> 8).astype(np.float32)
+                samples_f  = (samples_32.astype(np.int64) >> 8).astype(np.float32)
                 rms = np.sqrt(np.mean(samples_f ** 2)) if len(samples_f) > 0 else 0.0
                 if rms > 0:
-                    # Normalise against 24-bit full scale (2^23)
                     db = 20 * log10(rms / 8_388_608.0) + 120
                     db = max(0.0, min(120.0, db))
                     with state_lock:
                         latest_db = db
 
-    print("[Clip] Motion clip complete")
+    # ── Finalise clip ─────────────────────────────────────────────────────────
+    if writer is not None:
+        writer.release()
+        print(f"[Clip] Saved → {clip_path}")
+        with clip_queue_lock:
+            clip_queue.append(clip_path)
+    else:
+        print("[Clip] No frames received — nothing saved")
+
     return jsonify({"status": "ok"}), 200
 
 
@@ -176,7 +216,7 @@ def motion_clip():
 
 def frame_to_base64(frame):
     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    buffered = BytesIO()
+    buffered   = BytesIO()
     pil_image.save(buffered, format="JPEG", quality=85)
     return base64.b64encode(buffered.getvalue()).decode()
 
@@ -223,17 +263,26 @@ def draw_detections(frame, predictions):
 
 
 def draw_virtual_line(frame):
-    h = frame.shape[0]
-    cv2.line(frame, (LINE_POSITION, 0), (LINE_POSITION, h), (255, 0, 0), 3)
-    cv2.arrowedLine(frame, (LINE_POSITION - 40, 50), (LINE_POSITION - 10, 50), (0, 0, 255), 2)
-    cv2.putText(frame, "OUT", (LINE_POSITION - 80, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-    cv2.arrowedLine(frame, (LINE_POSITION + 10, 50), (LINE_POSITION + 40, 50), (0, 255, 0), 2)
-    cv2.putText(frame, "IN",  (LINE_POSITION + 50, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    if not LINE_VISIBLE:
+        return frame
+    h, w = frame.shape[:2]
+    if LINE_ORIENTATION == "vertical":
+        cv2.line(frame, (LINE_POSITION, 0), (LINE_POSITION, h), LINE_COLOR, LINE_THICKNESS)
+        cv2.arrowedLine(frame, (LINE_POSITION - 40, 50), (LINE_POSITION - 10, 50), (0, 0, 255), 2)
+        cv2.putText(frame, "OUT", (LINE_POSITION - 80, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        cv2.arrowedLine(frame, (LINE_POSITION + 10, 50), (LINE_POSITION + 40, 50), (0, 255, 0), 2)
+        cv2.putText(frame, "IN",  (LINE_POSITION + 50, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    else:
+        cv2.line(frame, (0, LINE_POSITION), (w, LINE_POSITION), LINE_COLOR, LINE_THICKNESS)
+        cv2.arrowedLine(frame, (50, LINE_POSITION - 10), (50, LINE_POSITION - 40), (0, 0, 255), 2)
+        cv2.putText(frame, "OUT", (60, LINE_POSITION - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        cv2.arrowedLine(frame, (50, LINE_POSITION + 10), (50, LINE_POSITION + 40), (0, 255, 0), 2)
+        cv2.putText(frame, "IN",  (60, LINE_POSITION + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     return frame
 
 
 def draw_sensor_overlay(frame, temp_c, humidity, db):
-    y = frame.shape[0] - 15
+    y        = frame.shape[0] - 15
     temp_f   = (temp_c * 9 / 5 + 32) if temp_c is not None else None
     temp_str = f"Temp: {temp_c:.1f}C / {temp_f:.1f}F" if temp_c is not None else "Temp: --"
     hum_str  = f"Hum: {humidity:.1f}%" if humidity is not None else "Hum: --"
@@ -258,20 +307,69 @@ def check_line_crossing(predictions):
         cx  = int(pred["x"])
         cy  = int(pred["y"])
         cls = pred.get("class", "object")
-        oid = f"{cls}_{cy // 50}"
+        if LINE_ORIENTATION == "vertical":
+            oid = f"{cls}_{cy // 50}"
+            pos = cx
+        else:
+            oid = f"{cls}_{cx // 50}"
+            pos = cy
         current_ids.add(oid)
         if oid in tracked_objects:
-            prev_x = tracked_objects[oid]
-            if prev_x < LINE_POSITION - CROSSING_THRESHOLD and cx > LINE_POSITION + CROSSING_THRESHOLD:
+            prev_pos = tracked_objects[oid]
+            if prev_pos < LINE_POSITION - CROSSING_THRESHOLD and pos > LINE_POSITION + CROSSING_THRESHOLD:
                 inside_count += 1
                 print(f">>> {cls} ENTERED | Inside: {inside_count}")
-            elif prev_x > LINE_POSITION + CROSSING_THRESHOLD and cx < LINE_POSITION - CROSSING_THRESHOLD:
+            elif prev_pos > LINE_POSITION + CROSSING_THRESHOLD and pos < LINE_POSITION - CROSSING_THRESHOLD:
                 inside_count = max(0, inside_count - 1)
                 print(f"<<< {cls} EXITED  | Inside: {inside_count}")
-        tracked_objects[oid] = cx
-    stale = [oid for oid in tracked_objects if oid not in current_ids]
-    for oid in stale[: max(0, len(stale) - 10)]:
+        tracked_objects[oid] = pos
+    for oid in [o for o in list(tracked_objects) if o not in current_ids]:
         del tracked_objects[oid]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Clip playback — called from display loop on main thread
+# ─────────────────────────────────────────────────────────────────────────────
+
+def play_clip(clip_path):
+    """Play back a saved clip in the display window at the original frame rate."""
+    global clip_playing
+    clip_playing = True
+
+    cap = cv2.VideoCapture(clip_path)
+    if not cap.isOpened():
+        print(f"[Playback] Could not open {clip_path}")
+        clip_playing = False
+        return
+
+    fps       = cap.get(cv2.CAP_PROP_FPS) or CLIP_FPS
+    delay_ms  = max(1, int(1000 / fps))
+    frame_num = 0
+    total     = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    clip_name = os.path.basename(clip_path)
+
+    print(f"[Playback] Playing {clip_name} ({total} frames @ {fps:.1f}fps)")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_num += 1
+        # Banner so user knows this is a replay not a live feed
+        banner = f"REPLAY: {clip_name}  [{frame_num}/{total}]  (Q=skip)"
+        cv2.putText(frame, banner, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
+
+        cv2.imshow("CCTV Detection System", frame)
+        key = cv2.waitKey(delay_ms) & 0xFF
+        if key in (ord("q"), ord("Q")):
+            print("[Playback] Skipped by user")
+            break
+
+    cap.release()
+    clip_playing = False
+    print(f"[Playback] Finished {clip_name}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,37 +408,64 @@ def periodic_send():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Periodic memory cleanup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def periodic_cleanup():
+    while True:
+        time.sleep(60)
+        gc.collect()
+        with state_lock:
+            global tracked_objects
+            if len(tracked_objects) > 100:
+                tracked_objects.clear()
+                print("[Cleanup] tracked_objects overflow — cleared")
+        print(f"[Cleanup] GC collected | tracked_objects: {len(tracked_objects)}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Display loop (runs in main thread)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def display_loop():
-    """Show the latest frame received from ESP32 with overlays."""
+    global frame_ready
+
     frame_count  = 0
     current_mode = "day"
 
     while True:
+
+        # ── Check for a queued clip to replay ────────────────────────────────
+        pending = None
+        with clip_queue_lock:
+            if clip_queue:
+                pending = clip_queue.pop(0)
+
+        if pending:
+            play_clip(pending)
+            continue   # loop back — check for more queued clips before going live
+
+        # ── Live feed ─────────────────────────────────────────────────────────
         with state_lock:
-            frame    = latest_frame.copy() if latest_frame is not None else None
-            preds    = latest_preds
-            db       = latest_db
-            temp_c   = latest_temp_c
-            humidity = latest_humidity
+            frame       = latest_frame.copy() if latest_frame is not None else None
+            preds       = latest_preds
+            db          = latest_db
+            temp_c      = latest_temp_c
+            humidity    = latest_humidity
+            frame_ready = False   # consumed — Flask may write next frame
 
         if frame is None:
-            # Show placeholder while waiting for first clip
             placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
             cv2.putText(placeholder, "Waiting for ESP32-CAM...", (120, 240),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
             cv2.imshow("CCTV Detection System", placeholder)
-        else:
-            frame_count += 1
-            frame = draw_virtual_line(frame)
-            if preds:
-                frame = draw_detections(frame, preds)
-            frame = draw_sensor_overlay(frame, temp_c, humidity, db)
-            status = f"Frame:{frame_count} | Inside:{inside_count} | Mode:{current_mode.upper()}"
-            cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.imshow("CCTV Detection System", frame)
+            cv2.waitKey(100)
+            continue
+
+        frame_count += 1
+        status = f"LIVE  Frame:{frame_count} | Inside:{inside_count} | Mode:{current_mode.upper()}"
+        cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.imshow("CCTV Detection System", frame)
 
         key = cv2.waitKey(30) & 0xFF
         if key in (ord("q"), ord("Q")):
@@ -362,14 +487,11 @@ def main():
     print("Starting ESP32-CAM CCTV receiver")
     print(f"  Flask port : {FLASK_PORT}  (ESP32 must point PI_PORT here)")
     print(f"  Roboflow   : {API_URL}")
-    print(f"  Send every : {SEND_INTERVAL}s\n")
+    print(f"  Send every : {SEND_INTERVAL}s")
+    print(f"  Clips dir  : {os.path.abspath(CLIPS_DIR)}\n")
 
-    # Allow large clip uploads (10s @ 10fps VGA JPEG ≈ 10–30 MB)
-    app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB hard cap
+    app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
-    # Flask runs in a background thread so display loop owns the main thread.
-    # use_reloader=False is required when Flask is not in the main thread.
-    # threaded=True lets /sensor and /motion_clip be handled concurrently.
     threading.Thread(
         target=lambda: app.run(
             host=FLASK_HOST,
@@ -380,12 +502,12 @@ def main():
         daemon=True
     ).start()
 
-    threading.Thread(target=periodic_send, daemon=True).start()
+    threading.Thread(target=periodic_send,    daemon=True).start()
+    threading.Thread(target=periodic_cleanup, daemon=True).start()
 
     if DISPLAY_WINDOW:
         display_loop()
     else:
-        # Headless — just keep alive
         try:
             while True:
                 time.sleep(1)
@@ -397,4 +519,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
